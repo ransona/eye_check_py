@@ -1,5 +1,6 @@
 import sys
 import os
+import getpass
 import pickle
 import shutil
 import cv2
@@ -44,6 +45,13 @@ class VideoAnalysisApp(QMainWindow):
         self.left_span = None
         self.right_span = None
 
+        # Zoom-to-eye display state
+        self.zoom_to_eye_enabled = False
+        self.zoom_roi_left = None
+        self.zoom_roi_right = None
+        self.zoom_contrast_left = None
+        self.zoom_contrast_right = None
+
         self.initUI()
         
     def initUI(self):
@@ -56,6 +64,7 @@ class VideoAnalysisApp(QMainWindow):
         inputLayout = QHBoxLayout()
         self.userIdEdit = QLineEdit()
         self.userIdEdit.setPlaceholderText("Enter User ID")
+        self.userIdEdit.setText(getpass.getuser())
         self.expIdEdit = QLineEdit()
         self.expIdEdit.setPlaceholderText("Enter Experiment ID")
         self.loadButton = QPushButton("Load Data")
@@ -89,6 +98,10 @@ class VideoAnalysisApp(QMainWindow):
         self.centerViewBtn = QPushButton("Jump to View Center")
         self.centerViewBtn.setEnabled(False)
         self.centerViewBtn.clicked.connect(self.jumpToViewCenter)
+        self.zoomEyeBtn = QPushButton("Zoom to Eye")
+        self.zoomEyeBtn.setCheckable(True)
+        self.zoomEyeBtn.setEnabled(False)
+        self.zoomEyeBtn.toggled.connect(self.toggleZoomToEye)
 
         controlLayout.addWidget(self.slider)
         controlLayout.addWidget(self.playButton)
@@ -96,6 +109,7 @@ class VideoAnalysisApp(QMainWindow):
         controlLayout.addWidget(QLabel("Current / Go to:"))
         controlLayout.addWidget(self.frameJumpEdit)
         controlLayout.addWidget(self.centerViewBtn)
+        controlLayout.addWidget(self.zoomEyeBtn)
         mainLayout.addLayout(controlLayout)
 
         # --- QC Editing Buttons ---
@@ -270,6 +284,15 @@ class VideoAnalysisApp(QMainWindow):
         self.saveBtn.setEnabled(True)
         self.frameJumpEdit.setEnabled(True)
         self.centerViewBtn.setEnabled(True)
+        self.zoomEyeBtn.setEnabled(True)
+        self.zoomEyeBtn.blockSignals(True)
+        self.zoomEyeBtn.setChecked(False)
+        self.zoomEyeBtn.blockSignals(False)
+        self.zoom_to_eye_enabled = False
+        self.zoom_roi_left = None
+        self.zoom_roi_right = None
+        self.zoom_contrast_left = None
+        self.zoom_contrast_right = None
         self.frameJumpEdit.setText("0")
 
         # Enable processing controls
@@ -289,17 +312,229 @@ class VideoAnalysisApp(QMainWindow):
         if 'QC' not in eyedat or eyedat['QC'] is None or len(eyedat['QC']) != n:
             eyedat['QC'] = np.zeros(n, dtype=int)
 
-    def overlay_plot(self, frame, position, eyeDat):
-        """
-        Draw the pupil circle unless any needed value is NaN.
-        """
-        if np.isnan(eyeDat['x'][position]) or np.isnan(eyeDat['y'][position]) or np.isnan(eyeDat['radius'][position]):
+    def _draw_xy_series(
+        self,
+        frame,
+        x_vals,
+        y_vals,
+        color,
+        point_radius=2,
+        connect=False,
+        thickness=1,
+        closed=False,
+        draw_points=True,
+        offset=(0, 0),
+    ):
+        """Draw per-frame x/y points, optionally connected as a polyline."""
+        x_vals = np.asarray(x_vals, dtype=float).reshape(-1)
+        y_vals = np.asarray(y_vals, dtype=float).reshape(-1)
+        finite = np.isfinite(x_vals) & np.isfinite(y_vals)
+        if not np.any(finite):
             return frame
-        color = (0, 0, 255)
-        center = (int(eyeDat['x'][position]), int(eyeDat['y'][position]))
-        radius = int(eyeDat['radius'][position])
-        frame = cv2.circle(frame, center, radius, color, 2)
+
+        x0, y0 = offset
+        pts = np.stack([x_vals[finite] - x0, y_vals[finite] - y0], axis=1).astype(np.int32)
+        if connect and len(pts) >= 2:
+            frame = cv2.polylines(frame, [pts], isClosed=closed, color=color, thickness=thickness)
+        if draw_points:
+            for px, py in pts:
+                frame = cv2.circle(frame, (int(px), int(py)), point_radius, color, -1)
         return frame
+
+    def overlay_plot(self, frame, position, eyeDat, offset=(0, 0)):
+        """
+        Draw fit overlays on top of the current frame.
+        """
+        x0, y0 = offset
+        is_zoomed = self.zoom_to_eye_enabled
+        circle_thickness = 2 if is_zoomed else 3
+        eye_line_thickness = 1 if is_zoomed else 2
+        pupil_point_radius = 2 if is_zoomed else 4
+        eye_anchor_point_radius = 2 if is_zoomed else 4
+
+        # Pupil fitted circle as a continuous line.
+        if np.isfinite(eyeDat['x'][position]) and np.isfinite(eyeDat['y'][position]) and np.isfinite(eyeDat['radius'][position]):
+            center = (int(eyeDat['x'][position] - x0), int(eyeDat['y'][position] - y0))
+            radius = int(eyeDat['radius'][position])
+            frame = cv2.circle(frame, center, radius, (0, 0, 255), circle_thickness)
+
+        # Eye outline as a continuous closed line.
+        if 'eye_lid_x' in eyeDat and 'eye_lid_y' in eyeDat:
+            eyelid_x = np.asarray(eyeDat['eye_lid_x'])
+            eyelid_y = np.asarray(eyeDat['eye_lid_y'])
+            if eyelid_x.ndim >= 2 and eyelid_y.ndim >= 2 and position < eyelid_x.shape[0] and position < eyelid_y.shape[0]:
+                frame = self._draw_xy_series(
+                    frame,
+                    eyelid_x[position],
+                    eyelid_y[position],
+                    color=(0, 255, 0),
+                    connect=True,
+                    thickness=eye_line_thickness,
+                    closed=True,
+                    draw_points=False,
+                    offset=offset,
+                )
+
+        # Raw eye anchor points (4 points used for eyelid fit) as dots.
+        if 'eyeX' in eyeDat and 'eyeY' in eyeDat:
+            eye_x = np.asarray(eyeDat['eyeX'])
+            eye_y = np.asarray(eyeDat['eyeY'])
+            if eye_x.ndim >= 2 and eye_y.ndim >= 2 and position < eye_x.shape[0] and position < eye_y.shape[0]:
+                frame = self._draw_xy_series(
+                    frame,
+                    eye_x[position],
+                    eye_y[position],
+                    color=(255, 128, 0),
+                    point_radius=eye_anchor_point_radius,
+                    connect=False,
+                    draw_points=True,
+                    offset=offset,
+                )
+
+        # Pupil points shown as dots over the fitted circle.
+        if 'pupilX' in eyeDat and 'pupilY' in eyeDat:
+            pupil_x = np.asarray(eyeDat['pupilX'])
+            pupil_y = np.asarray(eyeDat['pupilY'])
+            if pupil_x.ndim >= 2 and pupil_y.ndim >= 2 and position < pupil_x.shape[0] and position < pupil_y.shape[0]:
+                frame = self._draw_xy_series(
+                    frame,
+                    pupil_x[position],
+                    pupil_y[position],
+                    color=(255, 255, 0),
+                    point_radius=pupil_point_radius,
+                    connect=False,
+                    draw_points=True,
+                    offset=offset,
+                )
+        return frame
+
+    def _get_video_shape(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            return None
+        return frame.shape[:2]
+
+    def _compute_eye_zoom_roi(self, eyedat, frame_shape):
+        if 'eye_lid_x' not in eyedat or 'eye_lid_y' not in eyedat:
+            return None
+        x = np.asarray(eyedat['eye_lid_x'], dtype=float)
+        y = np.asarray(eyedat['eye_lid_y'], dtype=float)
+        if x.ndim != 2 or y.ndim != 2 or x.shape != y.shape or x.shape[0] == 0:
+            return None
+
+        left = np.nanmin(x, axis=1)
+        right = np.nanmax(x, axis=1)
+        top = np.nanmin(y, axis=1)
+        bottom = np.nanmax(y, axis=1)
+        valid = np.isfinite(left) & np.isfinite(right) & np.isfinite(top) & np.isfinite(bottom)
+        if not np.any(valid):
+            return None
+
+        left_med = float(np.nanmedian(left[valid]))
+        right_med = float(np.nanmedian(right[valid]))
+        top_med = float(np.nanmedian(top[valid]))
+        bottom_med = float(np.nanmedian(bottom[valid]))
+        width = right_med - left_med
+        height = bottom_med - top_med
+        if width <= 1 or height <= 1:
+            return None
+
+        # Expand the median eye bounds by 20% per side (40% total) to add border.
+        cx = 0.5 * (left_med + right_med)
+        cy = 0.5 * (top_med + bottom_med)
+        width *= 1.4
+        height *= 1.4
+
+        frame_h, frame_w = frame_shape
+        x0 = max(0, int(np.floor(cx - 0.5 * width)))
+        x1 = min(frame_w, int(np.ceil(cx + 0.5 * width)))
+        y0 = max(0, int(np.floor(cy - 0.5 * height)))
+        y1 = min(frame_h, int(np.ceil(cy + 0.5 * height)))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        return (x0, x1, y0, y1)
+
+    def _compute_zoom_contrast_limits(self, video_path, roi, sample_count=10):
+        x0, x1, y0, y1 = roi
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            cap.release()
+            return None
+
+        rng = np.random.default_rng(123)
+        picks = rng.choice(total_frames, size=min(sample_count, total_frames), replace=False)
+        samples = []
+        for idx in picks:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            crop = gray[y0:y1, x0:x1]
+            if crop.size:
+                samples.append(crop.reshape(-1))
+        cap.release()
+
+        if not samples:
+            return None
+        vals = np.concatenate(samples)
+        p10 = float(np.nanpercentile(vals, 10))
+        p90 = float(np.nanpercentile(vals, 90))
+        if (not np.isfinite(p10)) or (not np.isfinite(p90)) or p90 <= p10:
+            return None
+        return (p10, p90)
+
+    def _prepare_zoom_settings(self):
+        left_shape = self._get_video_shape(self.video_path_left)
+        right_shape = self._get_video_shape(self.video_path_right)
+        if left_shape is None or right_shape is None:
+            return False
+
+        self.zoom_roi_left = self._compute_eye_zoom_roi(self.left_eyedat, left_shape)
+        self.zoom_roi_right = self._compute_eye_zoom_roi(self.right_eyedat, right_shape)
+        if self.zoom_roi_left is None or self.zoom_roi_right is None:
+            return False
+
+        self.zoom_contrast_left = self._compute_zoom_contrast_limits(self.video_path_left, self.zoom_roi_left, sample_count=10)
+        self.zoom_contrast_right = self._compute_zoom_contrast_limits(self.video_path_right, self.zoom_roi_right, sample_count=10)
+        if self.zoom_contrast_left is None or self.zoom_contrast_right is None:
+            return False
+        return True
+
+    def toggleZoomToEye(self, enabled):
+        if not self.loaded:
+            self.zoom_to_eye_enabled = False
+            self.zoomEyeBtn.blockSignals(True)
+            self.zoomEyeBtn.setChecked(False)
+            self.zoomEyeBtn.blockSignals(False)
+            return
+
+        if enabled:
+            if not self._prepare_zoom_settings():
+                self.zoom_to_eye_enabled = False
+                self.zoomEyeBtn.blockSignals(True)
+                self.zoomEyeBtn.setChecked(False)
+                self.zoomEyeBtn.blockSignals(False)
+                QMessageBox.warning(self, "Zoom Error", "Could not compute eye zoom window from eye outline points.")
+                return
+            self.zoom_to_eye_enabled = True
+        else:
+            self.zoom_to_eye_enabled = False
+        self.updateFrame()
+
+    def _contrast_scale(self, gray_frame, low, high):
+        if (not np.isfinite(low)) or (not np.isfinite(high)) or high <= low:
+            return np.zeros_like(gray_frame, dtype=np.uint8)
+        scaled = (gray_frame - low) / (high - low)
+        scaled = np.clip(scaled, 0.0, 1.0) * 255.0
+        return scaled.astype(np.uint8)
 
     def playVideoFrame(self, frame_position, video_path, eyedat, side="Left"):
         """
@@ -311,14 +546,34 @@ class VideoAnalysisApp(QMainWindow):
         ret, frame = cap.read()
         cap.release()
         if ret:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = frame[:, :, 0]
-            frame[frame >= np.percentile(frame, 70)] = np.percentile(frame, 70)
-            min_val = np.min(frame)
-            max_val = np.max(frame)
-            frame = (frame - min_val) / (max_val - min_val) * 255
-            frame = np.stack((frame,) * 3, axis=-1).astype(np.uint8)
-            frame = self.overlay_plot(frame, frame_position, eyedat)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            offset = (0, 0)
+
+            if self.zoom_to_eye_enabled:
+                if side.lower() == "left":
+                    roi = self.zoom_roi_left
+                    contrast = self.zoom_contrast_left
+                else:
+                    roi = self.zoom_roi_right
+                    contrast = self.zoom_contrast_right
+
+                if roi is not None and contrast is not None:
+                    x0, x1, y0, y1 = roi
+                    gray = gray[y0:y1, x0:x1]
+                    offset = (x0, y0)
+                    low, high = contrast
+                    gray = self._contrast_scale(gray, low, high)
+                else:
+                    p70 = np.percentile(gray, 70)
+                    gray[gray >= p70] = p70
+                    gray = self._contrast_scale(gray, np.min(gray), np.max(gray))
+            else:
+                p70 = np.percentile(gray, 70)
+                gray[gray >= p70] = p70
+                gray = self._contrast_scale(gray, np.min(gray), np.max(gray))
+
+            frame = np.stack((gray,) * 3, axis=-1).astype(np.uint8)
+            frame = self.overlay_plot(frame, frame_position, eyedat, offset=offset)
             return frame
         return None
 
