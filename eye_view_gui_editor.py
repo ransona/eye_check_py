@@ -25,6 +25,66 @@ from matplotlib.widgets import SpanSelector
 import organise_paths
 
 
+class VideoDisplayLabel(QLabel):
+    def __init__(self, side_name, parent=None):
+        super().__init__(parent)
+        self.side_name = side_name
+        self.selection_enabled = False
+        self._drag_start = None
+        self._drag_end = None
+        self._on_roi_selected = None
+        self.setAlignment(Qt.AlignCenter)
+
+    def set_roi_callback(self, callback):
+        self._on_roi_selected = callback
+
+    def set_selection_enabled(self, enabled):
+        self.selection_enabled = bool(enabled)
+        if not self.selection_enabled:
+            self._drag_start = None
+            self._drag_end = None
+        self.update()
+
+    def mousePressEvent(self, event):
+        if self.selection_enabled and event.button() == Qt.LeftButton:
+            self._drag_start = event.pos()
+            self._drag_end = event.pos()
+            self.update()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.selection_enabled and self._drag_start is not None:
+            self._drag_end = event.pos()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.selection_enabled and self._drag_start is not None and event.button() == Qt.LeftButton:
+            self._drag_end = event.pos()
+            rect = QtCore.QRect(self._drag_start, self._drag_end).normalized()
+            self._drag_start = None
+            self._drag_end = None
+            self.update()
+            if self._on_roi_selected is not None:
+                self._on_roi_selected(rect)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.selection_enabled and self._drag_start is not None and self._drag_end is not None:
+            painter = QtGui.QPainter(self)
+            pen = QtGui.QPen(QtGui.QColor(255, 255, 0), 2, Qt.SolidLine)
+            painter.setPen(pen)
+            painter.drawRect(QtCore.QRect(self._drag_start, self._drag_end).normalized())
+            painter.end()
+
+
 class VideoAnalysisApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -49,8 +109,12 @@ class VideoAnalysisApp(QMainWindow):
         self.zoom_to_eye_enabled = False
         self.zoom_roi_left = None
         self.zoom_roi_right = None
-        self.zoom_contrast_left = None
-        self.zoom_contrast_right = None
+        self.manual_zoom_queue = []
+        self.manual_zoom_side = None
+        self.last_display_meta = {
+            'left': {'shape': None, 'offset': (0, 0)},
+            'right': {'shape': None, 'offset': (0, 0)},
+        }
 
         self.initUI()
         
@@ -173,12 +237,70 @@ class VideoAnalysisApp(QMainWindow):
         
         # --- Video Display Widgets ---
         videoLayout = QHBoxLayout()
-        self.leftVideoLabel = QLabel("Left Eye Video")
+        leftCol = QVBoxLayout()
+        rightCol = QVBoxLayout()
+
+        self.leftVideoHeader = QLabel("LEFT EYE")
+        self.leftVideoHeader.setAlignment(Qt.AlignCenter)
+        self.rightVideoHeader = QLabel("RIGHT EYE")
+        self.rightVideoHeader.setAlignment(Qt.AlignCenter)
+        left_header_font = self.leftVideoHeader.font()
+        left_header_font.setPointSize(max(1, int(round(left_header_font.pointSizeF() * 3))))
+        self.leftVideoHeader.setFont(left_header_font)
+        right_header_font = self.rightVideoHeader.font()
+        right_header_font.setPointSize(max(1, int(round(right_header_font.pointSizeF() * 3))))
+        self.rightVideoHeader.setFont(right_header_font)
+
+        self.leftBlackLabel = QLabel("Black: 0")
+        self.leftWhiteLabel = QLabel("White: 255")
+        self.leftBlackSlider = QSlider(Qt.Horizontal)
+        self.leftBlackSlider.setRange(0, 254)
+        self.leftBlackSlider.setValue(0)
+        self.leftBlackSlider.setEnabled(False)
+        self.leftBlackSlider.valueChanged.connect(self._on_video_levels_changed)
+        self.leftWhiteSlider = QSlider(Qt.Horizontal)
+        self.leftWhiteSlider.setRange(1, 255)
+        self.leftWhiteSlider.setValue(255)
+        self.leftWhiteSlider.setEnabled(False)
+        self.leftWhiteSlider.valueChanged.connect(self._on_video_levels_changed)
+
+        self.rightBlackLabel = QLabel("Black: 0")
+        self.rightWhiteLabel = QLabel("White: 255")
+        self.rightBlackSlider = QSlider(Qt.Horizontal)
+        self.rightBlackSlider.setRange(0, 254)
+        self.rightBlackSlider.setValue(0)
+        self.rightBlackSlider.setEnabled(False)
+        self.rightBlackSlider.valueChanged.connect(self._on_video_levels_changed)
+        self.rightWhiteSlider = QSlider(Qt.Horizontal)
+        self.rightWhiteSlider.setRange(1, 255)
+        self.rightWhiteSlider.setValue(255)
+        self.rightWhiteSlider.setEnabled(False)
+        self.rightWhiteSlider.valueChanged.connect(self._on_video_levels_changed)
+
+        self.leftVideoLabel = VideoDisplayLabel("left")
         self.leftVideoLabel.setFixedSize(320, 240)
-        self.rightVideoLabel = QLabel("Right Eye Video")
+        self.leftVideoLabel.setText("Left Eye Video")
+        self.leftVideoLabel.set_roi_callback(lambda rect: self._on_manual_roi_selected('left', rect))
+
+        self.rightVideoLabel = VideoDisplayLabel("right")
         self.rightVideoLabel.setFixedSize(320, 240)
-        videoLayout.addWidget(self.leftVideoLabel)
-        videoLayout.addWidget(self.rightVideoLabel)
+        self.rightVideoLabel.setText("Right Eye Video")
+        self.rightVideoLabel.set_roi_callback(lambda rect: self._on_manual_roi_selected('right', rect))
+
+        leftCol.addWidget(self.leftVideoHeader, alignment=Qt.AlignHCenter)
+        leftCol.addWidget(self.leftBlackLabel)
+        leftCol.addWidget(self.leftBlackSlider)
+        leftCol.addWidget(self.leftWhiteLabel)
+        leftCol.addWidget(self.leftWhiteSlider)
+        leftCol.addWidget(self.leftVideoLabel, alignment=Qt.AlignHCenter)
+        rightCol.addWidget(self.rightVideoHeader, alignment=Qt.AlignHCenter)
+        rightCol.addWidget(self.rightBlackLabel)
+        rightCol.addWidget(self.rightBlackSlider)
+        rightCol.addWidget(self.rightWhiteLabel)
+        rightCol.addWidget(self.rightWhiteSlider)
+        rightCol.addWidget(self.rightVideoLabel, alignment=Qt.AlignHCenter)
+        videoLayout.addLayout(leftCol)
+        videoLayout.addLayout(rightCol)
         mainLayout.addLayout(videoLayout)
         
         # --- Percentile Control Panel ---
@@ -291,8 +413,14 @@ class VideoAnalysisApp(QMainWindow):
         self.zoom_to_eye_enabled = False
         self.zoom_roi_left = None
         self.zoom_roi_right = None
-        self.zoom_contrast_left = None
-        self.zoom_contrast_right = None
+        self.manual_zoom_queue = []
+        self.manual_zoom_side = None
+        self.leftVideoLabel.set_selection_enabled(False)
+        self.rightVideoLabel.set_selection_enabled(False)
+        self.last_display_meta = {
+            'left': {'shape': None, 'offset': (0, 0)},
+            'right': {'shape': None, 'offset': (0, 0)},
+        }
         self.frameJumpEdit.setText("0")
 
         # Enable processing controls
@@ -300,6 +428,15 @@ class VideoAnalysisApp(QMainWindow):
         self.applyMedianBtn.setEnabled(True)
         self.maxGapEdit.setEnabled(True)
         self.fillGapsBtn.setEnabled(True)
+        self.leftBlackSlider.setEnabled(True)
+        self.leftWhiteSlider.setEnabled(True)
+        self.rightBlackSlider.setEnabled(True)
+        self.rightWhiteSlider.setEnabled(True)
+
+        # Initialize display saturation from random frames:
+        # black = darkest pixel, white = 60th percentile.
+        self._auto_initialize_video_levels()
+        self._on_video_levels_changed()
 
         self.loaded = True
         
@@ -311,6 +448,77 @@ class VideoAnalysisApp(QMainWindow):
         n = len(eyedat.get('x', []))
         if 'QC' not in eyedat or eyedat['QC'] is None or len(eyedat['QC']) != n:
             eyedat['QC'] = np.zeros(n, dtype=int)
+
+    def _set_levels_from_frame(self, gray_frame, side):
+        if gray_frame is None or gray_frame.size == 0:
+            return
+        p_black = int(np.clip(np.nanmin(gray_frame), 0, 254))
+        p_white = int(np.clip(np.nanpercentile(gray_frame, 60), 1, 255))
+        if p_white <= p_black:
+            p_white = min(255, p_black + 1)
+
+        if side == 'left':
+            self.leftBlackSlider.blockSignals(True)
+            self.leftWhiteSlider.blockSignals(True)
+            self.leftBlackSlider.setValue(p_black)
+            self.leftWhiteSlider.setValue(p_white)
+            self.leftBlackSlider.blockSignals(False)
+            self.leftWhiteSlider.blockSignals(False)
+        else:
+            self.rightBlackSlider.blockSignals(True)
+            self.rightWhiteSlider.blockSignals(True)
+            self.rightBlackSlider.setValue(p_black)
+            self.rightWhiteSlider.setValue(p_white)
+            self.rightBlackSlider.blockSignals(False)
+            self.rightWhiteSlider.blockSignals(False)
+
+    def _random_gray_frame(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n <= 0:
+            cap.release()
+            return None
+        idx = int(np.random.default_rng().integers(0, n))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            return None
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    def _auto_initialize_video_levels(self):
+        left_gray = self._random_gray_frame(self.video_path_left)
+        right_gray = self._random_gray_frame(self.video_path_right)
+        if left_gray is not None:
+            self._set_levels_from_frame(left_gray, 'left')
+        if right_gray is not None:
+            self._set_levels_from_frame(right_gray, 'right')
+
+    def _on_video_levels_changed(self):
+        left_b = int(self.leftBlackSlider.value())
+        left_w = int(self.leftWhiteSlider.value())
+        if left_w <= left_b:
+            left_w = min(255, left_b + 1)
+            self.leftWhiteSlider.blockSignals(True)
+            self.leftWhiteSlider.setValue(left_w)
+            self.leftWhiteSlider.blockSignals(False)
+        self.leftBlackLabel.setText(f"Black: {left_b}")
+        self.leftWhiteLabel.setText(f"White: {left_w}")
+
+        right_b = int(self.rightBlackSlider.value())
+        right_w = int(self.rightWhiteSlider.value())
+        if right_w <= right_b:
+            right_w = min(255, right_b + 1)
+            self.rightWhiteSlider.blockSignals(True)
+            self.rightWhiteSlider.setValue(right_w)
+            self.rightWhiteSlider.blockSignals(False)
+        self.rightBlackLabel.setText(f"Black: {right_b}")
+        self.rightWhiteLabel.setText(f"White: {right_w}")
+
+        if self.loaded:
+            self.updateFrame()
 
     def _draw_xy_series(
         self,
@@ -419,17 +627,60 @@ class VideoAnalysisApp(QMainWindow):
         return frame.shape[:2]
 
     def _compute_eye_zoom_roi(self, eyedat, frame_shape):
-        if 'eye_lid_x' not in eyedat or 'eye_lid_y' not in eyedat:
-            return None
-        x = np.asarray(eyedat['eye_lid_x'], dtype=float)
-        y = np.asarray(eyedat['eye_lid_y'], dtype=float)
-        if x.ndim != 2 or y.ndim != 2 or x.shape != y.shape or x.shape[0] == 0:
+        def coerce_point_matrix(arr):
+            """
+            Convert per-frame point storage to a 2D float matrix [n_frames, n_points].
+            Supports dense numeric arrays and object arrays of per-frame vectors.
+            """
+            a = np.asarray(arr, dtype=object)
+            if a.ndim == 2 and a.dtype != object:
+                return a.astype(float, copy=False)
+            if a.ndim == 1:
+                rows = []
+                max_len = 0
+                for item in a:
+                    row = np.asarray(item, dtype=float).reshape(-1)
+                    rows.append(row)
+                    if row.size > max_len:
+                        max_len = row.size
+                if max_len == 0 or len(rows) == 0:
+                    return None
+                out = np.full((len(rows), max_len), np.nan, dtype=float)
+                for i, row in enumerate(rows):
+                    out[i, :row.size] = row
+                return out
+            try:
+                b = np.asarray(arr, dtype=float)
+                if b.ndim == 2:
+                    return b
+            except Exception:
+                pass
             return None
 
-        left = np.nanmin(x, axis=1)
-        right = np.nanmax(x, axis=1)
-        top = np.nanmin(y, axis=1)
-        bottom = np.nanmax(y, axis=1)
+        # Prefer continuous eyelid fit; fall back to 4 anchor points if needed.
+        if 'eye_lid_x' in eyedat and 'eye_lid_y' in eyedat:
+            x = coerce_point_matrix(eyedat['eye_lid_x'])
+            y = coerce_point_matrix(eyedat['eye_lid_y'])
+            if x is None or y is None or x.shape != y.shape or x.shape[0] == 0:
+                x = None
+                y = None
+        else:
+            x = None
+            y = None
+
+        if x is None or y is None:
+            if 'eyeX' not in eyedat or 'eyeY' not in eyedat:
+                return None
+            x = coerce_point_matrix(eyedat['eyeX'])
+            y = coerce_point_matrix(eyedat['eyeY'])
+            if x is None or y is None or x.shape != y.shape or x.shape[0] == 0:
+                return None
+
+        with np.errstate(all='ignore'):
+            left = np.nanmin(x, axis=1)
+            right = np.nanmax(x, axis=1)
+            top = np.nanmin(y, axis=1)
+            bottom = np.nanmax(y, axis=1)
         valid = np.isfinite(left) & np.isfinite(right) & np.isfinite(top) & np.isfinite(bottom)
         if not np.any(valid):
             return None
@@ -458,39 +709,6 @@ class VideoAnalysisApp(QMainWindow):
             return None
         return (x0, x1, y0, y1)
 
-    def _compute_zoom_contrast_limits(self, video_path, roi, sample_count=10):
-        x0, x1, y0, y1 = roi
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return None
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            cap.release()
-            return None
-
-        rng = np.random.default_rng(123)
-        picks = rng.choice(total_frames, size=min(sample_count, total_frames), replace=False)
-        samples = []
-        for idx in picks:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            crop = gray[y0:y1, x0:x1]
-            if crop.size:
-                samples.append(crop.reshape(-1))
-        cap.release()
-
-        if not samples:
-            return None
-        vals = np.concatenate(samples)
-        p10 = float(np.nanpercentile(vals, 10))
-        p90 = float(np.nanpercentile(vals, 90))
-        if (not np.isfinite(p10)) or (not np.isfinite(p90)) or p90 <= p10:
-            return None
-        return (p10, p90)
-
     def _prepare_zoom_settings(self):
         left_shape = self._get_video_shape(self.video_path_left)
         right_shape = self._get_video_shape(self.video_path_right)
@@ -499,14 +717,9 @@ class VideoAnalysisApp(QMainWindow):
 
         self.zoom_roi_left = self._compute_eye_zoom_roi(self.left_eyedat, left_shape)
         self.zoom_roi_right = self._compute_eye_zoom_roi(self.right_eyedat, right_shape)
-        if self.zoom_roi_left is None or self.zoom_roi_right is None:
-            return False
 
-        self.zoom_contrast_left = self._compute_zoom_contrast_limits(self.video_path_left, self.zoom_roi_left, sample_count=10)
-        self.zoom_contrast_right = self._compute_zoom_contrast_limits(self.video_path_right, self.zoom_roi_right, sample_count=10)
-        if self.zoom_contrast_left is None or self.zoom_contrast_right is None:
-            return False
-        return True
+        # Allow zoom mode when at least one side has a valid ROI.
+        return (self.zoom_roi_left is not None) or (self.zoom_roi_right is not None)
 
     def toggleZoomToEye(self, enabled):
         if not self.loaded:
@@ -517,17 +730,133 @@ class VideoAnalysisApp(QMainWindow):
             return
 
         if enabled:
-            if not self._prepare_zoom_settings():
-                self.zoom_to_eye_enabled = False
-                self.zoomEyeBtn.blockSignals(True)
-                self.zoomEyeBtn.setChecked(False)
-                self.zoomEyeBtn.blockSignals(False)
-                QMessageBox.warning(self, "Zoom Error", "Could not compute eye zoom window from eye outline points.")
-                return
             self.zoom_to_eye_enabled = True
+            self._prepare_zoom_settings()
+            self.manual_zoom_queue = []
+            if self.zoom_roi_left is None:
+                self.manual_zoom_queue.append('left')
+            if self.zoom_roi_right is None:
+                self.manual_zoom_queue.append('right')
+
+            if self.manual_zoom_queue:
+                self._prompt_next_manual_zoom_eye()
+            else:
+                self._set_manual_zoom_side(None)
         else:
             self.zoom_to_eye_enabled = False
+            self.manual_zoom_queue = []
+            self._set_manual_zoom_side(None)
         self.updateFrame()
+
+    def _set_manual_zoom_side(self, side):
+        self.manual_zoom_side = side
+        self.leftVideoLabel.set_selection_enabled(side == 'left')
+        self.rightVideoLabel.set_selection_enabled(side == 'right')
+
+    def _prompt_next_manual_zoom_eye(self):
+        while self.manual_zoom_queue:
+            side = self.manual_zoom_queue.pop(0)
+            side_name = "LEFT" if side == 'left' else "RIGHT"
+            choice = QMessageBox.question(
+                self,
+                "Auto Zoom Unavailable",
+                (
+                    f"{side_name} eye auto-zoom window could not be computed.\n"
+                    "Do you want to draw the zoom window manually for this eye?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if choice == QMessageBox.Yes:
+                self._set_manual_zoom_side(side)
+                QMessageBox.information(
+                    self,
+                    "Manual Zoom Selection",
+                    f"Drag a rectangle on the {side_name} eye video.",
+                )
+                self.updateFrame()
+                return
+
+        # Completed manual prompts for all failed eyes.
+        self._set_manual_zoom_side(None)
+        if self.zoom_roi_left is None and self.zoom_roi_right is None:
+            self.zoom_to_eye_enabled = False
+            self.zoomEyeBtn.blockSignals(True)
+            self.zoomEyeBtn.setChecked(False)
+            self.zoomEyeBtn.blockSignals(False)
+            QMessageBox.warning(
+                self,
+                "Zoom Disabled",
+                "Zoom was disabled because no valid auto or manual zoom windows were set.",
+            )
+        self.updateFrame()
+
+    def _label_rect_to_fullframe_roi(self, side, rect):
+        meta = self.last_display_meta.get(side, {})
+        shape = meta.get('shape', None)
+        offset = meta.get('offset', (0, 0))
+        if shape is None:
+            return None
+
+        frame_h, frame_w = shape
+        label = self.leftVideoLabel if side == 'left' else self.rightVideoLabel
+        label_w = max(1, label.width())
+        label_h = max(1, label.height())
+
+        scale = min(label_w / float(frame_w), label_h / float(frame_h))
+        draw_w = max(1, int(round(frame_w * scale)))
+        draw_h = max(1, int(round(frame_h * scale)))
+        x_pad = (label_w - draw_w) / 2.0
+        y_pad = (label_h - draw_h) / 2.0
+
+        x0 = max(rect.left(), x_pad)
+        x1 = min(rect.right(), x_pad + draw_w)
+        y0 = max(rect.top(), y_pad)
+        y1 = min(rect.bottom(), y_pad + draw_h)
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        fx0 = int(np.floor((x0 - x_pad) / scale))
+        fx1 = int(np.ceil((x1 - x_pad) / scale))
+        fy0 = int(np.floor((y0 - y_pad) / scale))
+        fy1 = int(np.ceil((y1 - y_pad) / scale))
+        fx0 = max(0, min(frame_w - 1, fx0))
+        fx1 = max(1, min(frame_w, fx1))
+        fy0 = max(0, min(frame_h - 1, fy0))
+        fy1 = max(1, min(frame_h, fy1))
+        if fx1 - fx0 < 2 or fy1 - fy0 < 2:
+            return None
+
+        off_x, off_y = offset
+        return (fx0 + off_x, fx1 + off_x, fy0 + off_y, fy1 + off_y)
+
+    def _on_manual_roi_selected(self, side, rect):
+        if not self.zoom_to_eye_enabled or self.manual_zoom_side != side:
+            return
+
+        roi = self._label_rect_to_fullframe_roi(side, rect)
+        if roi is None:
+            QMessageBox.warning(self, "Selection Error", "Please drag a larger rectangle inside the video image.")
+            return
+
+        if side == 'left':
+            self.zoom_roi_left = roi
+        else:
+            self.zoom_roi_right = roi
+
+        self._set_manual_zoom_side(None)
+        self._prompt_next_manual_zoom_eye()
+
+    def _get_display_levels(self, side):
+        if side == 'left':
+            low = float(self.leftBlackSlider.value())
+            high = float(self.leftWhiteSlider.value())
+        else:
+            low = float(self.rightBlackSlider.value())
+            high = float(self.rightWhiteSlider.value())
+        if high <= low:
+            high = low + 1.0
+        return low, high
 
     def _contrast_scale(self, gray_frame, low, high):
         if (not np.isfinite(low)) or (not np.isfinite(high)) or high <= low:
@@ -546,34 +875,30 @@ class VideoAnalysisApp(QMainWindow):
         ret, frame = cap.read()
         cap.release()
         if ret:
+            side_key = side.lower()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
             offset = (0, 0)
 
             if self.zoom_to_eye_enabled:
                 if side.lower() == "left":
                     roi = self.zoom_roi_left
-                    contrast = self.zoom_contrast_left
                 else:
                     roi = self.zoom_roi_right
-                    contrast = self.zoom_contrast_right
 
-                if roi is not None and contrast is not None:
+                if roi is not None:
                     x0, x1, y0, y1 = roi
                     gray = gray[y0:y1, x0:x1]
                     offset = (x0, y0)
-                    low, high = contrast
-                    gray = self._contrast_scale(gray, low, high)
-                else:
-                    p70 = np.percentile(gray, 70)
-                    gray[gray >= p70] = p70
-                    gray = self._contrast_scale(gray, np.min(gray), np.max(gray))
-            else:
-                p70 = np.percentile(gray, 70)
-                gray[gray >= p70] = p70
-                gray = self._contrast_scale(gray, np.min(gray), np.max(gray))
+            low, high = self._get_display_levels(side_key)
+            gray = self._contrast_scale(gray, low, high)
 
             frame = np.stack((gray,) * 3, axis=-1).astype(np.uint8)
             frame = self.overlay_plot(frame, frame_position, eyedat, offset=offset)
+            if side_key in self.last_display_meta:
+                self.last_display_meta[side_key] = {
+                    'shape': frame.shape[:2],
+                    'offset': offset,
+                }
             return frame
         return None
 
