@@ -1,6 +1,9 @@
 import sys
 import os
 import getpass
+import json
+import time
+import traceback
 import pickle
 import shutil
 import cv2
@@ -10,7 +13,8 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QProgressDialog, QShortcut
+    QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QProgressDialog, QShortcut,
+    QDialog, QListWidget, QComboBox, QFileDialog
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QKeySequence
@@ -85,6 +89,638 @@ class VideoDisplayLabel(QLabel):
             painter.end()
 
 
+def _build_cnn_model(arch_name: str):
+    try:
+        import torchvision.models as tv_models
+        import torch.nn as nn
+        if arch_name == "resnet18":
+            model = tv_models.resnet18(weights=None)
+            n_features = model.fc.in_features
+            model.fc = nn.Linear(n_features, 1)
+            return model
+    except Exception:
+        pass
+
+    # Fallback if torchvision is unavailable.
+    import torch.nn as nn
+    return nn.Sequential(
+        nn.Conv2d(3, 16, 3, padding=1),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),
+        nn.Conv2d(16, 32, 3, padding=1),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),
+        nn.Conv2d(32, 64, 3, padding=1),
+        nn.ReLU(inplace=True),
+        nn.AdaptiveAvgPool2d((1, 1)),
+        nn.Flatten(),
+        nn.Linear(64, 1),
+    )
+
+
+def _preprocess_gray_for_cnn(gray_img: np.ndarray, input_size: int = 224) -> np.ndarray:
+    gray = np.asarray(gray_img, dtype=np.float32)
+    resized = cv2.resize(gray, (input_size, input_size), interpolation=cv2.INTER_AREA)
+    resized = np.clip(resized, 0, 255) / 255.0
+    chw = np.stack([resized, resized, resized], axis=0)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+    chw = (chw - mean) / std
+    return chw.astype(np.float32)
+
+
+class ClassifierTrainWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(dict)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, classifier_dir, arch_name="resnet18", epochs=8, batch_size=32):
+        super().__init__()
+        self.classifier_dir = classifier_dir
+        self.arch_name = arch_name
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+
+    def _load_examples(self):
+        present_dir = os.path.join(self.classifier_dir, "present")
+        absent_dir = os.path.join(self.classifier_dir, "absent")
+        present_files = sorted(
+            [os.path.join(present_dir, x) for x in os.listdir(present_dir) if x.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))]
+        )
+        absent_files = sorted(
+            [os.path.join(absent_dir, x) for x in os.listdir(absent_dir) if x.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))]
+        )
+        return present_files, absent_files
+
+    def run(self):
+        try:
+            import torch
+            from torch import nn
+            from torch.utils.data import Dataset, DataLoader
+
+            present_files, absent_files = self._load_examples()
+            n_pos = len(present_files)
+            n_neg = len(absent_files)
+            if n_pos < 2 or n_neg < 2:
+                raise RuntimeError("Need at least 2 present and 2 absent frames to train.")
+
+            rng = np.random.default_rng(42)
+            rng.shuffle(present_files)
+            rng.shuffle(absent_files)
+            n_val_pos = max(1, int(round(0.2 * n_pos)))
+            n_val_neg = max(1, int(round(0.2 * n_neg)))
+
+            val_pos = present_files[:n_val_pos]
+            train_pos = present_files[n_val_pos:]
+            val_neg = absent_files[:n_val_neg]
+            train_neg = absent_files[n_val_neg:]
+            if len(train_pos) == 0 or len(train_neg) == 0:
+                raise RuntimeError("Not enough training examples after split; add more examples.")
+
+            train_items = [(p, 1.0) for p in train_pos] + [(p, 0.0) for p in train_neg]
+            val_items = [(p, 1.0) for p in val_pos] + [(p, 0.0) for p in val_neg]
+            rng.shuffle(train_items)
+            rng.shuffle(val_items)
+
+            class FrameDataset(Dataset):
+                def __init__(self, items, input_size=224):
+                    self.items = items
+                    self.input_size = input_size
+
+                def __len__(self):
+                    return len(self.items)
+
+                def __getitem__(self, idx):
+                    path, label = self.items[idx]
+                    gray = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                    if gray is None:
+                        raise RuntimeError(f"Could not read training image: {path}")
+                    arr = _preprocess_gray_for_cnn(gray, input_size=self.input_size)
+                    x = torch.from_numpy(arr)
+                    y = torch.tensor([label], dtype=torch.float32)
+                    return x, y
+
+            input_size = 224
+            train_ds = FrameDataset(train_items, input_size=input_size)
+            val_ds = FrameDataset(val_items, input_size=input_size)
+            train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, num_workers=0)
+            val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=0)
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.progress.emit(f"Training on device: {device}")
+            model = _build_cnn_model(self.arch_name).to(device)
+
+            pos_weight_value = max(1e-6, float(len(train_neg)) / float(len(train_pos)))
+            pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+            use_amp = torch.cuda.is_available()
+            scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+            best_val_acc = -1.0
+            best_state = None
+            best_epoch = 0
+
+            for epoch in range(1, self.epochs + 1):
+                model.train()
+                running_loss = 0.0
+                seen = 0
+                for x, y in train_loader:
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        logits = model(x)
+                        loss = criterion(logits, y)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    running_loss += float(loss.item()) * x.size(0)
+                    seen += x.size(0)
+
+                model.eval()
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    for x, y in val_loader:
+                        x = x.to(device, non_blocking=True)
+                        y = y.to(device, non_blocking=True)
+                        logits = model(x)
+                        probs = torch.sigmoid(logits)
+                        preds = (probs >= 0.5).float()
+                        correct += int((preds == y).sum().item())
+                        total += int(y.numel())
+                val_acc = (correct / total) if total > 0 else 0.0
+                train_loss = running_loss / max(1, seen)
+                self.progress.emit(f"Epoch {epoch}/{self.epochs} | loss={train_loss:.4f} | val_acc={val_acc:.3f}")
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_epoch = epoch
+                    best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+            if best_state is None:
+                raise RuntimeError("Training failed to produce a valid model state.")
+
+            models_dir = os.path.join(self.classifier_dir, "models")
+            os.makedirs(models_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            model_path = os.path.join(models_dir, f"{stamp}_{self.arch_name}.pt")
+            payload = {
+                "arch_name": self.arch_name,
+                "input_size": 224,
+                "threshold": 0.5,
+                "state_dict": best_state,
+                "metrics": {
+                    "best_val_acc": float(best_val_acc),
+                    "best_epoch": int(best_epoch),
+                    "n_train": int(len(train_items)),
+                    "n_val": int(len(val_items)),
+                    "n_present_total": int(n_pos),
+                    "n_absent_total": int(n_neg),
+                },
+            }
+            torch.save(payload, model_path)
+            self.finished.emit({"model_path": model_path, "metrics": payload["metrics"]})
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class ClassifierBuilderWindow(QDialog):
+    def __init__(self, app_window):
+        super().__init__(app_window)
+        self.app_window = app_window
+        self.setWindowTitle("Build Classifier")
+        self.setModal(False)
+        self.resize(980, 620)
+
+        self.classifier_dir = None
+        self.training_thread = None
+        self.training_worker = None
+
+        self._init_ui()
+        self.rootPathEdit.setText(os.path.expanduser("~/data/eye_view_gui/classifiers/"))
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        path_row = QHBoxLayout()
+        self.rootPathEdit = QLineEdit()
+        browse_btn = QPushButton("Browse")
+        browse_btn.clicked.connect(self._browse_root)
+        path_row.addWidget(QLabel("Classifier root"))
+        path_row.addWidget(self.rootPathEdit)
+        path_row.addWidget(browse_btn)
+        layout.addLayout(path_row)
+
+        name_row = QHBoxLayout()
+        self.classifierNameEdit = QLineEdit()
+        self.classifierNameEdit.setPlaceholderText("e.g. white_secretion")
+        self.initBtn = QPushButton("Initialize classifier")
+        self.initBtn.clicked.connect(self._initialize_classifier)
+        self.loadBtn = QPushButton("Load existing classifier")
+        self.loadBtn.clicked.connect(self._load_existing_classifier)
+        name_row.addWidget(QLabel("Classifier name"))
+        name_row.addWidget(self.classifierNameEdit)
+        name_row.addWidget(self.initBtn)
+        name_row.addWidget(self.loadBtn)
+        layout.addLayout(name_row)
+
+        self.classifierPathLabel = QLabel("Classifier path: (not initialized)")
+        layout.addWidget(self.classifierPathLabel)
+
+        act_row = QHBoxLayout()
+        self.eyeToggle = QComboBox()
+        self.eyeToggle.addItems(["Left eye", "Right eye"])
+        self.surroundCountEdit = QLineEdit("6")
+        self.surroundCountEdit.setFixedWidth(60)
+        self.surroundSpacingEdit = QLineEdit("3")
+        self.surroundSpacingEdit.setFixedWidth(60)
+        self.addPresentBtn = QPushButton("Add feature present frame")
+        self.addAbsentBtn = QPushButton("Add feature absent frame")
+        self.deleteBtn = QPushButton("Delete selected example frame")
+        self.addPresentBtn.clicked.connect(lambda: self._add_example("present"))
+        self.addAbsentBtn.clicked.connect(lambda: self._add_example("absent"))
+        self.deleteBtn.clicked.connect(self._delete_selected_example)
+        act_row.addWidget(QLabel("Copy eye"))
+        act_row.addWidget(self.eyeToggle)
+        act_row.addWidget(QLabel("Surrounding"))
+        act_row.addWidget(self.surroundCountEdit)
+        act_row.addWidget(QLabel("Spacing"))
+        act_row.addWidget(self.surroundSpacingEdit)
+        act_row.addWidget(self.addPresentBtn)
+        act_row.addWidget(self.addAbsentBtn)
+        act_row.addWidget(self.deleteBtn)
+        layout.addLayout(act_row)
+
+        center_row = QHBoxLayout()
+        self.presentList = QListWidget()
+        self.absentList = QListWidget()
+        self.presentList.currentTextChanged.connect(lambda _: self._preview_selected("present"))
+        self.absentList.currentTextChanged.connect(lambda _: self._preview_selected("absent"))
+        center_row.addWidget(self.presentList)
+        center_row.addWidget(self.absentList)
+
+        self.previewLabel = QLabel("Example preview")
+        self.previewLabel.setAlignment(Qt.AlignCenter)
+        self.previewLabel.setMinimumSize(320, 240)
+        self.previewLabel.setStyleSheet("border: 1px solid #777;")
+        center_row.addWidget(self.previewLabel)
+        layout.addLayout(center_row)
+
+        train_row = QHBoxLayout()
+        self.trainBtn = QPushButton("Train classifier")
+        self.trainBtn.clicked.connect(self._train_classifier)
+        self.modelList = QListWidget()
+        self.classifyBtn = QPushButton("Classify current frame")
+        self.classifyBtn.clicked.connect(self._classify_current_frame)
+        train_col = QVBoxLayout()
+        train_col.addWidget(self.trainBtn)
+        train_col.addWidget(QLabel("Trained models"))
+        train_col.addWidget(self.modelList)
+        train_col.addWidget(self.classifyBtn)
+        train_row.addLayout(train_col)
+
+        self.logText = QtWidgets.QPlainTextEdit()
+        self.logText.setReadOnly(True)
+        train_row.addWidget(self.logText)
+        layout.addLayout(train_row)
+
+    def _log(self, text):
+        self.logText.appendPlainText(text)
+
+    def _browse_root(self):
+        path = QFileDialog.getExistingDirectory(self, "Select classifier root", self.rootPathEdit.text().strip() or os.path.expanduser("~"))
+        if path:
+            self.rootPathEdit.setText(path)
+
+    def _initialize_classifier(self):
+        root = os.path.expanduser(self.rootPathEdit.text().strip())
+        name = self.classifierNameEdit.text().strip()
+        if not root or not name:
+            QMessageBox.warning(self, "Input Error", "Please set classifier root and classifier name.")
+            return
+
+        self.classifier_dir = os.path.join(root, name)
+        existed = os.path.isdir(self.classifier_dir)
+        os.makedirs(os.path.join(self.classifier_dir, "present"), exist_ok=True)
+        os.makedirs(os.path.join(self.classifier_dir, "absent"), exist_ok=True)
+        os.makedirs(os.path.join(self.classifier_dir, "models"), exist_ok=True)
+        meta_path = os.path.join(self.classifier_dir, "meta.json")
+        if not os.path.exists(meta_path):
+            with open(meta_path, "w") as f:
+                json.dump({"name": name, "created": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+
+        self.classifierPathLabel.setText(f"Classifier path: {self.classifier_dir}")
+        self._refresh_example_lists()
+        self._refresh_model_list()
+        if existed:
+            self._log(f"Loaded existing classifier at {self.classifier_dir}")
+        else:
+            self._log(f"Initialized classifier at {self.classifier_dir}")
+
+    def _load_existing_classifier(self):
+        root = os.path.expanduser(self.rootPathEdit.text().strip())
+        name = self.classifierNameEdit.text().strip()
+        if not root or not name:
+            QMessageBox.warning(self, "Input Error", "Please set classifier root and classifier name.")
+            return
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            QMessageBox.warning(self, "Not found", f"Classifier does not exist:\n{path}")
+            return
+        self.classifier_dir = path
+        os.makedirs(os.path.join(self.classifier_dir, "present"), exist_ok=True)
+        os.makedirs(os.path.join(self.classifier_dir, "absent"), exist_ok=True)
+        os.makedirs(os.path.join(self.classifier_dir, "models"), exist_ok=True)
+        self.classifierPathLabel.setText(f"Classifier path: {self.classifier_dir}")
+        self._refresh_example_lists()
+        self._refresh_model_list()
+        self._log(f"Loaded existing classifier at {self.classifier_dir}")
+
+    def _index_path(self):
+        if self.classifier_dir is None:
+            return None
+        return os.path.join(self.classifier_dir, "examples_index.json")
+
+    def _load_examples_index(self):
+        path = self._index_path()
+        if path is None or (not os.path.exists(path)):
+            return {"records": []}
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or "records" not in data or not isinstance(data["records"], list):
+                return {"records": []}
+            return data
+        except Exception:
+            return {"records": []}
+
+    def _save_examples_index(self, data):
+        path = self._index_path()
+        if path is None:
+            return
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def _source_key(self, exp_id, side_key, frame_idx):
+        return f"{exp_id}|{side_key}|{int(frame_idx)}"
+
+    def _indexed_source_keys(self):
+        data = self._load_examples_index()
+        keys = set()
+        for rec in data.get("records", []):
+            key = self._source_key(rec.get("exp_id", ""), rec.get("side", ""), rec.get("frame_idx", -1))
+            keys.add(key)
+        return keys
+
+    def _current_side_key(self):
+        return "left" if self.eyeToggle.currentIndex() == 0 else "right"
+
+    def _save_example_frame(self, side_key, target_dir, frame_idx):
+        gray = self.app_window.get_raw_video_frame(side_key, frame_index=frame_idx)
+        if gray is None:
+            raise RuntimeError("Could not read current video frame.")
+        exp_id = str(getattr(self.app_window, "expID", "unknown"))
+        safe_exp = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in exp_id)
+        stamp = int(time.time() * 1000)
+        fname = f"{safe_exp}_{side_key}_frame_{frame_idx:06d}_{stamp}.png"
+        path = os.path.join(target_dir, fname)
+        if not cv2.imwrite(path, gray):
+            raise RuntimeError(f"Could not write frame to {path}")
+        return path
+
+    def _add_example(self, category):
+        if self.classifier_dir is None:
+            QMessageBox.warning(self, "Not initialized", "Initialize classifier first.")
+            return
+        if not self.app_window.loaded:
+            QMessageBox.warning(self, "No data", "Load data in the main GUI first.")
+            return
+        target_dir = os.path.join(self.classifier_dir, category)
+        side_key = self._current_side_key()
+        exp_id = str(getattr(self.app_window, "expID", "unknown"))
+        try:
+            n_surrounding = int(float(self.surroundCountEdit.text().strip()))
+            spacing = int(float(self.surroundSpacingEdit.text().strip()))
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Surrounding and spacing must be integers.")
+            return
+        n_surrounding = max(0, n_surrounding)
+        spacing = max(1, spacing)
+
+        center_idx = int(self.app_window.slider.value())
+        max_idx = int(self.app_window.total_frames - 1)
+        n_pairs = n_surrounding // 2
+        offsets = [0]
+        for k in range(1, n_pairs + 1):
+            d = k * spacing
+            offsets.extend([-d, d])
+        if n_surrounding % 2 == 1:
+            offsets.append((n_pairs + 1) * spacing)
+
+        frame_indices = []
+        seen = set()
+        for off in offsets:
+            idx = max(0, min(max_idx, center_idx + off))
+            if idx not in seen:
+                seen.add(idx)
+                frame_indices.append(idx)
+        try:
+            index_data = self._load_examples_index()
+            existing_keys = self._indexed_source_keys()
+            duplicate_indices = []
+            add_indices = []
+            for frame_idx in frame_indices:
+                key = self._source_key(exp_id, side_key, frame_idx)
+                if key in existing_keys:
+                    duplicate_indices.append(frame_idx)
+                else:
+                    add_indices.append(frame_idx)
+
+            if duplicate_indices:
+                QMessageBox.warning(
+                    self,
+                    "Duplicate example(s)",
+                    f"Skipped {len(duplicate_indices)} duplicate source frame(s) for {exp_id}/{side_key}: "
+                    + ", ".join(str(x) for x in duplicate_indices[:10])
+                    + ("..." if len(duplicate_indices) > 10 else ""),
+                )
+
+            saved = []
+            for frame_idx in add_indices:
+                path = self._save_example_frame(side_key, target_dir, frame_idx=frame_idx)
+                saved.append(path)
+                index_data["records"].append(
+                    {
+                        "exp_id": exp_id,
+                        "side": side_key,
+                        "frame_idx": int(frame_idx),
+                        "category": category,
+                        "file": os.path.basename(path),
+                        "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                )
+            self._save_examples_index(index_data)
+            self._refresh_example_lists()
+            self._log(
+                f"Saved {len(saved)} {category} example(s) from frame {center_idx} "
+                f"(surrounding={n_surrounding}, spacing={spacing})."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
+
+    def _refresh_example_lists(self):
+        self.presentList.clear()
+        self.absentList.clear()
+        if self.classifier_dir is None:
+            return
+        for category, widget in (("present", self.presentList), ("absent", self.absentList)):
+            d = os.path.join(self.classifier_dir, category)
+            if not os.path.isdir(d):
+                continue
+            files = sorted([x for x in os.listdir(d) if x.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))])
+            widget.addItems(files)
+
+    def _selected_example_path(self):
+        if self.presentList.hasFocus() and self.presentList.currentItem() is not None:
+            return os.path.join(self.classifier_dir, "present", self.presentList.currentItem().text())
+        if self.absentList.hasFocus() and self.absentList.currentItem() is not None:
+            return os.path.join(self.classifier_dir, "absent", self.absentList.currentItem().text())
+        if self.presentList.currentItem() is not None:
+            return os.path.join(self.classifier_dir, "present", self.presentList.currentItem().text())
+        if self.absentList.currentItem() is not None:
+            return os.path.join(self.classifier_dir, "absent", self.absentList.currentItem().text())
+        return None
+
+    def _delete_selected_example(self):
+        if self.classifier_dir is None:
+            return
+        path = self._selected_example_path()
+        if path is None or not os.path.exists(path):
+            QMessageBox.information(self, "Delete", "No example selected.")
+            return
+        os.remove(path)
+        data = self._load_examples_index()
+        fname = os.path.basename(path)
+        data["records"] = [r for r in data.get("records", []) if r.get("file") != fname]
+        self._save_examples_index(data)
+        self._refresh_example_lists()
+        self.previewLabel.setPixmap(QtGui.QPixmap())
+        self.previewLabel.setText("Example preview")
+        self._log(f"Deleted example: {os.path.basename(path)}")
+
+    def _preview_selected(self, category):
+        if self.classifier_dir is None:
+            return
+        widget = self.presentList if category == "present" else self.absentList
+        item = widget.currentItem()
+        if item is None:
+            return
+        path = os.path.join(self.classifier_dir, category, item.text())
+        pix = QtGui.QPixmap(path)
+        if pix.isNull():
+            self.previewLabel.setText("Failed to load preview")
+            return
+        self.previewLabel.setPixmap(pix.scaled(self.previewLabel.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _refresh_model_list(self):
+        self.modelList.clear()
+        if self.classifier_dir is None:
+            return
+        d = os.path.join(self.classifier_dir, "models")
+        if not os.path.isdir(d):
+            return
+        files = sorted([x for x in os.listdir(d) if x.lower().endswith(".pt")])
+        self.modelList.addItems(files)
+
+    def _train_classifier(self):
+        if self.classifier_dir is None:
+            QMessageBox.warning(self, "Not initialized", "Initialize classifier first.")
+            return
+        if self.training_thread is not None:
+            QMessageBox.information(self, "Training", "Training already in progress.")
+            return
+
+        self.training_thread = QtCore.QThread(self)
+        self.training_worker = ClassifierTrainWorker(self.classifier_dir, arch_name="resnet18", epochs=8, batch_size=32)
+        self.training_worker.moveToThread(self.training_thread)
+        self.training_thread.started.connect(self.training_worker.run)
+        self.training_worker.progress.connect(self._log)
+        self.training_worker.finished.connect(self._on_training_finished)
+        self.training_worker.failed.connect(self._on_training_failed)
+        self.training_worker.finished.connect(self.training_thread.quit)
+        self.training_worker.failed.connect(self.training_thread.quit)
+        self.training_thread.finished.connect(self._cleanup_training_thread)
+        self.trainBtn.setEnabled(False)
+        self._log("Started training...")
+        self.training_thread.start()
+
+    def _cleanup_training_thread(self):
+        if self.training_worker is not None:
+            self.training_worker.deleteLater()
+        if self.training_thread is not None:
+            self.training_thread.deleteLater()
+        self.training_worker = None
+        self.training_thread = None
+        self.trainBtn.setEnabled(True)
+
+    def _on_training_finished(self, result):
+        model_path = result.get("model_path", "")
+        metrics = result.get("metrics", {})
+        self._log(f"Training complete: {model_path}")
+        self._log(f"Best val acc: {metrics.get('best_val_acc', 0.0):.3f}")
+        self._refresh_model_list()
+
+    def _on_training_failed(self, err):
+        self._log("Training failed.")
+        self._log(err)
+        QMessageBox.critical(self, "Training Error", err.splitlines()[-1] if err else "Unknown training error")
+
+    def _classify_current_frame(self):
+        if self.classifier_dir is None:
+            QMessageBox.warning(self, "Not initialized", "Initialize classifier first.")
+            return
+        item = self.modelList.currentItem()
+        if item is None:
+            QMessageBox.warning(self, "No model", "Select a trained model.")
+            return
+        if not self.app_window.loaded:
+            QMessageBox.warning(self, "No data", "Load data in the main GUI first.")
+            return
+
+        model_path = os.path.join(self.classifier_dir, "models", item.text())
+        side_key = self._current_side_key()
+        gray = self.app_window.get_raw_video_frame(side_key)
+        if gray is None:
+            QMessageBox.warning(self, "Frame Error", "Could not read current frame.")
+            return
+
+        try:
+            import torch
+
+            payload = torch.load(model_path, map_location="cpu")
+            arch_name = payload.get("arch_name", "resnet18")
+            input_size = int(payload.get("input_size", 224))
+            threshold = float(payload.get("threshold", 0.5))
+
+            model = _build_cnn_model(arch_name)
+            model.load_state_dict(payload["state_dict"])
+            model.eval()
+
+            x = _preprocess_gray_for_cnn(gray, input_size=input_size)
+            x = torch.from_numpy(x).unsqueeze(0)
+            with torch.no_grad():
+                logits = model(x)
+                prob = float(torch.sigmoid(logits).item())
+            has_feature = prob >= threshold
+            text = "Feature present" if has_feature else "Feature absent"
+            QMessageBox.information(self, "Classifier result", f"{text}\nConfidence: {prob:.3f}")
+            self._log(f"Inference ({item.text()}): prob={prob:.3f} -> {text}")
+        except Exception as e:
+            QMessageBox.critical(self, "Inference Error", str(e))
+
+
 class VideoAnalysisApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -115,6 +751,7 @@ class VideoAnalysisApp(QMainWindow):
             'left': {'shape': None, 'offset': (0, 0)},
             'right': {'shape': None, 'offset': (0, 0)},
         }
+        self.classifier_builder_window = None
 
         self.initUI()
         
@@ -166,6 +803,9 @@ class VideoAnalysisApp(QMainWindow):
         self.zoomEyeBtn.setCheckable(True)
         self.zoomEyeBtn.setEnabled(False)
         self.zoomEyeBtn.toggled.connect(self.toggleZoomToEye)
+        self.buildClassifierBtn = QPushButton("Build Classifier")
+        self.buildClassifierBtn.setEnabled(False)
+        self.buildClassifierBtn.clicked.connect(self.openClassifierBuilder)
 
         controlLayout.addWidget(self.slider)
         controlLayout.addWidget(self.playButton)
@@ -174,6 +814,7 @@ class VideoAnalysisApp(QMainWindow):
         controlLayout.addWidget(self.frameJumpEdit)
         controlLayout.addWidget(self.centerViewBtn)
         controlLayout.addWidget(self.zoomEyeBtn)
+        controlLayout.addWidget(self.buildClassifierBtn)
         mainLayout.addLayout(controlLayout)
 
         # --- QC Editing Buttons ---
@@ -347,12 +988,15 @@ class VideoAnalysisApp(QMainWindow):
         if not self.userID or not self.expID:
             QMessageBox.warning(self, "Input Error", "Please enter both User ID and Experiment ID")
             return
-        
-        # Get paths using the custom module.
+
+        # Get paths using the shared path resolver.
         self.animalID, self.remote_repository_root, self.processed_root, \
             self.exp_dir_processed, self.exp_dir_raw = organise_paths.find_paths(self.userID, self.expID)
         self.exp_dir_processed_recordings = os.path.join(self.exp_dir_processed, 'recordings')
         self.exp_dir_processed_cut = os.path.join(self.exp_dir_processed, 'cut')
+        if (self.userID.lower() == "habit") and (not os.path.isdir(self.exp_dir_processed_recordings)):
+            # In habituation datasets files may sit directly under the animal folder.
+            self.exp_dir_processed_recordings = self.exp_dir_processed
         
         # Video file paths.
         self.video_path_left = os.path.join(self.exp_dir_processed, f"{self.expID}_eye1_left.avi")
@@ -407,6 +1051,7 @@ class VideoAnalysisApp(QMainWindow):
         self.frameJumpEdit.setEnabled(True)
         self.centerViewBtn.setEnabled(True)
         self.zoomEyeBtn.setEnabled(True)
+        self.buildClassifierBtn.setEnabled(True)
         self.zoomEyeBtn.blockSignals(True)
         self.zoomEyeBtn.setChecked(False)
         self.zoomEyeBtn.blockSignals(False)
@@ -846,6 +1491,27 @@ class VideoAnalysisApp(QMainWindow):
 
         self._set_manual_zoom_side(None)
         self._prompt_next_manual_zoom_eye()
+
+    def openClassifierBuilder(self):
+        if self.classifier_builder_window is None:
+            self.classifier_builder_window = ClassifierBuilderWindow(self)
+        self.classifier_builder_window.show()
+        self.classifier_builder_window.raise_()
+        self.classifier_builder_window.activateWindow()
+
+    def get_raw_video_frame(self, side_key, frame_index=None):
+        if not self.loaded:
+            return None
+        if frame_index is None:
+            frame_index = int(self.slider.value())
+        video_path = self.video_path_left if side_key == "left" else self.video_path_right
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            return None
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     def _get_display_levels(self, side):
         if side == 'left':
