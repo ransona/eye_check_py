@@ -993,11 +993,7 @@ class VideoAnalysisApp(QMainWindow):
         self.animalID, self.remote_repository_root, self.processed_root, \
             self.exp_dir_processed, self.exp_dir_raw = organise_paths.find_paths(self.userID, self.expID)
         self.exp_dir_processed_recordings = os.path.join(self.exp_dir_processed, 'recordings')
-        self.exp_dir_processed_cut = os.path.join(self.exp_dir_processed, 'cut')
-        if (self.userID.lower() == "habit") and (not os.path.isdir(self.exp_dir_processed_recordings)):
-            # In habituation datasets files may sit directly under the animal folder.
-            self.exp_dir_processed_recordings = self.exp_dir_processed
-        
+        self.exp_dir_processed_cut = os.path.join(self.exp_dir_processed, 'cut')        
         # Video file paths.
         self.video_path_left = os.path.join(self.exp_dir_processed, f"{self.expID}_eye1_left.avi")
         self.video_path_right = os.path.join(self.exp_dir_processed, f"{self.expID}_eye1_right.avi")
